@@ -20,7 +20,6 @@ for Phonopy version 2.17.1
 
 class LibraryModificationRequired(Exception):
     """Raised when the required library modifications have not been made."""
-
     pass
 
 
@@ -32,6 +31,7 @@ class MinikappaManager:
         temperatures=[300.0, 600.0, 900.0],
         tau_factors=[2.0],
         n_histogram_bins=50,
+        save_histogram=False,
     ):
         """
         Args:
@@ -39,20 +39,17 @@ class MinikappaManager:
             mesh (float | 1x3 array[int]): q-point mesh density
             temperatures (array[float]) in Kelvin
             tau_factors (array[float])
+            n_histogram_bins (int)
+            save_histogram (bool)
         """
         self.phonon = phonon
         self.mesh = mesh
         self.temperatures = temperatures
         self.tau_factors = tau_factors
         self.n_histogram_bins = n_histogram_bins
+        self.save_histogram = save_histogram
 
-    def get_minikappa(self, verbose=True):
-        def vprint(message, verbose=True):
-            if verbose:
-                print(message)
-
-        # Mesh
-        vprint(f"Running phonon mesh...\n", verbose)
+    def get_mesh_dict(self):
         try:
             self.phonon.run_mesh(
                 self.mesh,
@@ -73,31 +70,132 @@ class MinikappaManager:
             else:
                 raise
         mesh_dict = self.phonon.get_mesh_dict()
-        qpoints = mesh_dict["qpoints"]
-        freqs = mesh_dict["frequencies"]
-        gvfull = mesh_dict["group_velocities_full"]
+        return mesh_dict
+
+    @staticmethod
+    def get_maximum_scattering_rates(freqs, tau_factor):
+        """
+        Args:
+            freqs (np.array[nqpt, nband])
+            tau_factor (float)
+                Note: tau_factor=2 corresponds to the assumption from our paper
+        Returns:
+            Gamma (np.array(nqpt, nband]): scattering rate for each phonon mode
+        """
+        nqpt, nband = freqs.shape
+        Gamma = np.ones((nqpt, nband)) * 1e10
+        for iq, i in itertools.product(range(nqpt), range(nband)):
+            omega = freqs[iq, i]
+            if omega > 0:
+                Gamma[iq, i] = omega / 2 / np.pi * tau_factor
+        return Gamma
+
+    def calculate_minikappa(
+        self,
+        freqs,
+        Gamma,
+        gvfull,
+        temperature=300.0,
+        freqcf=0.1,
+        filename_prefix=None,
+    ):
+        """
+        Args:
+            freqs (np.array[nqpt, nband], dtype=float): phonon frequencies in 2*pi*THz
+            Gamma (np.array[nqpt, nband], dtype=float): phonon lifetimes in ps
+            gvfull (np.array[nqpt, nband, nband, 3], dtype=complex): full diagonal and 
+                off-diagonal group velocities in km/s
+            temperature (float): temperature in Kelvin
+            freqcf (float): cutoff frequency. Any frequency below this value will not
+                contribute to the thermal conductivity
+            filename_prefix (str)
+        """
+        if filename_prefix is None:
+            filename_prefix = f"minikappa-{temperature}"
 
         # Units
         hbar = 1.054571726470000e-022
         kB = 1.380648813000000e-023
-        pi = np.pi
 
-        primcell = self.phonon.primitive.cell.T
-        volpc = np.abs(np.dot(np.cross(primcell[1], primcell[2]), primcell[0])) / 1000.0
-        gvfull = gvfull / 10.0
-        freqs = freqs * 2 * pi
-        freqcf = 0.1
+        volpc = self.phonon.primitive.volume / 1000.0  # Angs^3 to nm^3
+        nqpt, nband = freqs.shape
 
         delta_freq = np.max(freqs + 1e-01) / self.n_histogram_bins
-        histogram_kappa_d = np.zeros(
-            (self.n_histogram_bins, self.n_histogram_bins, 3, 3)
-        )
-        histogram_kappa_od = np.zeros(
-            (self.n_histogram_bins, self.n_histogram_bins, 3, 3)
-        )
+        histogram_kappa_d = np.zeros((self.n_histogram_bins, self.n_histogram_bins, 3, 3))
+        histogram_kappa_od = np.zeros((self.n_histogram_bins, self.n_histogram_bins, 3, 3))
+
+        kappaband = np.zeros((nband, nband, 3, 3), dtype=np.complex128, order="C")
+        for iq, i, j, k, kp in itertools.product(
+            range(nqpt),
+            range(nband),
+            range(nband),
+            range(3),
+            range(3),
+        ):
+            omega1 = freqs[iq, i]
+            omega2 = freqs[iq, j]
+            if omega1 <= freqcf or omega2 <= freqcf:
+                continue
+            Gamma1 = Gamma[iq, i]
+            Gamma2 = Gamma[iq, j]
+            fBE1 = 1.0 / (np.exp(hbar * omega1 / kB / temperature) - 1.0)
+            fBE2 = 1.0 / (np.exp(hbar * omega2 / kB / temperature) - 1.0)
+            tmpv = (gvfull[iq, i, j, k] * gvfull[iq, j, i, kp]).real
+            kappaband_tmp = (omega1+omega2)/2 * \
+                (fBE1*(fBE1+1)*omega1+fBE2*(fBE2+1)*omega2) * tmpv \
+                / (4*(omega1-omega2)**2+(Gamma1+Gamma2)**2) \
+                * (Gamma1+Gamma2)
+            kappaband[i, j, k, kp] += kappaband_tmp
+
+            idx_freq1 = int(omega1 // delta_freq)
+            idx_freq2 = int(omega2 // delta_freq)
+            if i == j:
+                histogram_kappa_d[idx_freq1, idx_freq2, k, kp] += kappaband_tmp
+            else:
+                histogram_kappa_od[idx_freq1, idx_freq2, k, kp] += kappaband_tmp
+
+        # conversion
+        unit_factor = 1e21 * hbar**2 / (kB * temperature**2 * volpc * nqpt)
+        kappaband *= unit_factor
+        histogram_kappa_d *= unit_factor
+        histogram_kappa_od *= unit_factor
+        if self.save_histogram:
+            for direction, index in zip(["xx", "yy", "zz"], [0, 1, 2]):
+                np.savetxt(
+                    f"{filename_prefix}-d_{direction}.txt",
+                    histogram_kappa_d[:, :, index, index],
+                )
+                np.savetxt(
+                    f"{filename_prefix}-od_{direction}.txt",
+                    histogram_kappa_od[:, :, index, index],
+                )
+
+        kappaD = np.zeros((3, 3), dtype=np.complex128, order="C")
+        kappaOD = np.zeros((3, 3), dtype=np.complex128, order="C")
+        kappaF = np.zeros((3, 3), dtype=np.complex128, order="C")
+        for i, j in itertools.product(range(nband), range(nband)):
+            kappaF += kappaband[i, j]
+            if i == j:
+                kappaD += kappaband[i, j]
+            else:
+                kappaOD += kappaband[i, j]
+        kappaD = kappaD.real
+        kappaOD = kappaOD.real
+        kappaF = kappaF.real
+        return kappaD, kappaOD, kappaF
+
+    def run_minikappa(self, verbose=True):
+        def vprint(message, verbose=True):
+            if verbose:
+                print(message)
+
+        # Mesh
+        vprint(f"Running phonon mesh... {self.mesh=}", verbose)
+        mesh_dict = self.get_mesh_dict()
+        freqs = mesh_dict["frequencies"] * 2 * np.pi  # THz -> 2*pi*THz
+        gvfull = mesh_dict["group_velocities_full"] / 10.0  # Angs*THz -> nm*THz == km/s
 
         # kappa
-        nqpt, nband = freqs.shape
         results = {}
         for temperature in self.temperatures:
             results[temperature] = {}
@@ -107,106 +205,47 @@ class MinikappaManager:
                     f"Calculating minikappa... T={temperature}K, tau={tau_factor}",
                     verbose,
                 )
-                kappaband = np.zeros(
-                    (nband, nband, 3, 3), dtype=np.complex128, order="C"
+                Gamma = self.get_maximum_scattering_rates(freqs, tau_factor=tau_factor)
+                filename_prefix = f"minikappa-{temperature}-{tau_factor}"
+                kappaD, kappaOD, kappaF = self.calculate_minikappa(
+                    freqs,
+                    Gamma,
+                    gvfull,
+                    temperature=temperature,
+                    filename_prefix=filename_prefix,
                 )
-                for iq, i, j, k, kp in itertools.product(
-                    range(nqpt),
-                    range(nband),
-                    range(nband),
-                    range(3),
-                    range(3),
-                ):
-                    omega1 = freqs[iq, i]
-                    omega2 = freqs[iq, j]
-                    if omega1 > freqcf and omega2 > freqcf:
-                        if omega1 > 0:
-                            Gamma1 = omega1 / 2 / pi * tau_factor
-                        else:
-                            Gamma1 = 1e10
-                        if omega2 > 0:
-                            Gamma2 = omega2 / 2 / pi * tau_factor
-                        else:
-                            Gamma2 = 1e10
-                        fBE1 = 1.0 / (np.exp(hbar * omega1 / kB / temperature) - 1.0)
-                        fBE2 = 1.0 / (np.exp(hbar * omega2 / kB / temperature) - 1.0)
-                        tmpv = (gvfull[iq, i, j, k] * gvfull[iq, j, i, kp]).real
-                        kappaband_tmp = (omega1+omega2)/2 * \
-                            (fBE1*(fBE1+1)*omega1+fBE2*(fBE2+1)*omega2) * tmpv \
-                            / (4*(omega1-omega2)**2+(Gamma1+Gamma2)**2) \
-                            * (Gamma1+Gamma2)
-                        kappaband[i, j, k, kp] += kappaband_tmp
-
-                        idx_freq1 = int(omega1 // delta_freq)
-                        idx_freq2 = int(omega2 // delta_freq)
-                        if i == j:
-                            histogram_kappa_d[
-                                idx_freq1, idx_freq2, k, kp
-                            ] += kappaband_tmp
-                        else:
-                            histogram_kappa_od[
-                                idx_freq1, idx_freq2, k, kp
-                            ] += kappaband_tmp
-
-                # conversion
-                unit_factor = 1e21 * hbar**2 / (kB * temperature**2 * volpc * nqpt)
-                kappaband *= unit_factor
-                histogram_kappa_d *= unit_factor
-                histogram_kappa_od *= unit_factor
-                np.savetxt(
-                    f"minikappa-{temperature}-{tau_factor}-od_xx.txt",
-                    histogram_kappa_od[:, :, 0, 0],
-                )
-                np.savetxt(
-                    f"minikappa-{temperature}-{tau_factor}-od_yy.txt",
-                    histogram_kappa_od[:, :, 1, 1],
-                )
-                np.savetxt(
-                    f"minikappa-{temperature}-{tau_factor}-od_zz.txt",
-                    histogram_kappa_od[:, :, 2, 2],
-                )
-
-                kappaD = np.zeros((3, 3), dtype=np.complex128, order="C")
-                kappaOD = np.zeros((3, 3), dtype=np.complex128, order="C")
-                kappaF = np.zeros((3, 3), dtype=np.complex128, order="C")
-                for i in range(nband):
-                    for j in range(nband):
-                        kappaF += kappaband[i, j]
-                        if i == j:
-                            kappaD += kappaband[i, j]
-                        else:
-                            kappaOD += kappaband[i, j]
-                kappaD = kappaD.real
-                kappaOD = kappaOD.real
-                kappaF = kappaF.real
                 results[temperature][tau_factor]["D"] = kappaD
                 results[temperature][tau_factor]["OD"] = kappaOD
                 results[temperature][tau_factor]["F"] = kappaF
 
-                output_filename = f"minikappa-{temperature}-{tau_factor}.dat"
+                output_filename = f"{filename_prefix}.dat"
                 vprint(f"Writing to {output_filename}", verbose)
                 with open(output_filename, "w+") as fw:
                     for kappa_matrix in [kappaD, kappaOD, kappaF]:
                         kappa_matrix = np.round(
-                            kappa_matrix.reshape(9, 1).flatten(),
+                            kappa_matrix.flatten(),
                             decimals=8,
                         )
                         fw.write(
                             "".join([f"{num:>14.8f}" for num in kappa_matrix]) + "\n"
                         )
+                kappaD_scalar = np.mean(np.diag(kappaD))
+                kappaOD_scalar = np.mean(np.diag(kappaOD))
+                kappaF_scalar = np.mean(np.diag(kappaF))
 
                 vprint(
                     "Diagonal part of minimum thermal conductivity: "
-                    f"{kappaD[0, 0]:.3f}",
+                    + f"{kappaD_scalar:.3f} W/m/K",
                     verbose,
                 )
                 vprint(
                     "Off-diagonal part of minimum thermal conductivity: "
-                    f"{kappaOD[0, 0]:.3f}",
+                    + f"{kappaOD_scalar:.3f} W/m/K",
                     verbose,
                 )
                 vprint(
-                    "Total minimum thermal conductivity: " f"{kappaF[0, 0]:.3f}",
+                    "Total minimum thermal conductivity: "
+                    + f"{kappaF_scalar:.3f} W/m/K\n",
                     verbose,
                 )
                 vprint("", verbose)
@@ -241,7 +280,7 @@ class MinikappaManager:
         return cls(phonon, **kwargs)
 
     @classmethod
-    def from_data(
+    def from_parameters(
         cls,
         poscar_path,
         supercell_matrix,
@@ -274,15 +313,20 @@ class MinikappaManager:
 def read_minikappa_file(fpath, verbose=False):
     minikappa_output = np.loadtxt(fpath)
     kappaD, kappaOD, kappaF = minikappa_output.reshape(3, 3, 3)
+    kappaD_scalar = np.mean(np.diag(kappaD))
+    kappaOD_scalar = np.mean(np.diag(kappaOD))
+    kappaF_scalar = np.mean(np.diag(kappaF))
     if verbose:
-        print(
-            f"Diagonal part of minimum thermal conductivity: {kappaD[0, 0]:.3f}",
+            "Diagonal part of minimum thermal conductivity: "
+            + f"{kappaD_scalar:.3f} W/m/K",
         )
         print(
-            f"Off-diagonal part of minimum thermal conductivity: {kappaOD[0, 0]:.3f}",
+            "Off-diagonal part of minimum thermal conductivity: "
+            + f"{kappaOD_scalar:.3f} W/m/K",
         )
         print(
-            f"Total minimum thermal conductivity: {kappaF[0, 0]:.3f}",
+            "Total minimum thermal conductivity: "
+            + "{kappaF_scalar:.3f} W/m/K\n",
         )
     return kappaD, kappaOD, kappaF
 
@@ -291,7 +335,7 @@ if __name__ == "__main__":
     """
     Here's an example of using from_data to calculate kL_min
     """
-    minikappa_manager = MinikappaManager.from_data(
+    minikappa_manager = MinikappaManager.from_parameters(
         poscar_path="POSCAR-unitcell",
         supercell_matrix=np.eye(3) * 4,
         primitive_matrix=np.eye(3),
@@ -300,15 +344,18 @@ if __name__ == "__main__":
             "temperatures": [600.0],
         },
     )
-    results = minikappa_manager.get_minikappa(verbose=True)
+    results = minikappa_manager.run_minikappa(verbose=True)
 
     """
     Here's an example of using from_phonopy_yaml to calculate kL_min
     """
     # minikappa_manager = MinikappaManager.from_phonopy_yaml(
+    #     yaml_path="phonopy.yaml",
+    #     force_constants_filename="FORCE_CONSTANTS",
     #     kwargs={
     #         "mesh": 25.0,
     #         "temperatures": [300.0, 600.0, 900.0],
     #         "tau_factors": [1.0, 2.0],
     #     },
     # )
+    # results = minikappa_manager.run_minikappa(verbose=True)

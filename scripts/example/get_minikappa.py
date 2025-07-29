@@ -4,7 +4,7 @@ sys.path.append("..")
 import numpy as np
 from minikappa import MinikappaManager
 
-minikappa_manager = MinikappaManager.from_data(
+minikappa_manager = MinikappaManager.from_parameters(
     poscar_path="POSCAR-unitcell",
     supercell_matrix=np.eye(3) * 4,
     primitive_matrix=np.eye(3),
