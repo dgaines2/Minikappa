@@ -20,6 +20,7 @@ for Phonopy version 2.17.1
 
 class LibraryModificationRequired(Exception):
     """Raised when the required library modifications have not been made."""
+
     pass
 
 
@@ -30,6 +31,7 @@ class MinikappaManager:
         mesh=25.0,
         temperatures=[300.0, 600.0, 900.0],
         tau_factors=[2.0],
+        n_histogram_bins=50,
     ):
         """
         Args:
@@ -42,6 +44,7 @@ class MinikappaManager:
         self.mesh = mesh
         self.temperatures = temperatures
         self.tau_factors = tau_factors
+        self.n_histogram_bins = n_histogram_bins
 
     def get_minikappa(self, verbose=True):
         def vprint(message, verbose=True):
@@ -83,12 +86,18 @@ class MinikappaManager:
         volpc = np.abs(np.dot(np.cross(primcell[1], primcell[2]), primcell[0])) / 1000.0
         gvfull = gvfull / 10.0
         freqs = freqs * 2 * pi
-        nband = len(freqs[0])
         freqcf = 0.1
 
+        delta_freq = np.max(freqs + 1e-01) / self.n_histogram_bins
+        histogram_kappa_d = np.zeros(
+            (self.n_histogram_bins, self.n_histogram_bins, 3, 3)
+        )
+        histogram_kappa_od = np.zeros(
+            (self.n_histogram_bins, self.n_histogram_bins, 3, 3)
+        )
+
         # kappa
-        nqpt = len(qpoints)
-        nband = len(freqs[0])
+        nqpt, nband = freqs.shape
         results = {}
         for temperature in self.temperatures:
             results[temperature] = {}
@@ -122,15 +131,41 @@ class MinikappaManager:
                         fBE1 = 1.0 / (np.exp(hbar * omega1 / kB / temperature) - 1.0)
                         fBE2 = 1.0 / (np.exp(hbar * omega2 / kB / temperature) - 1.0)
                         tmpv = (gvfull[iq, i, j, k] * gvfull[iq, j, i, kp]).real
-                        kappaband[i,j,k,kp] += (omega1+omega2)/2 * \
-                                            (fBE1*(fBE1+1)*omega1+fBE2*(fBE2+1)*omega2) * tmpv \
-                                            / (4*(omega1-omega2)**2+(Gamma1+Gamma2)**2) \
-                                            * (Gamma1+Gamma2)
+                        kappaband_tmp = (omega1+omega2)/2 * \
+                            (fBE1*(fBE1+1)*omega1+fBE2*(fBE2+1)*omega2) * tmpv \
+                            / (4*(omega1-omega2)**2+(Gamma1+Gamma2)**2) \
+                            * (Gamma1+Gamma2)
+                        kappaband[i, j, k, kp] += kappaband_tmp
+
+                        idx_freq1 = int(omega1 // delta_freq)
+                        idx_freq2 = int(omega2 // delta_freq)
+                        if i == j:
+                            histogram_kappa_d[
+                                idx_freq1, idx_freq2, k, kp
+                            ] += kappaband_tmp
+                        else:
+                            histogram_kappa_od[
+                                idx_freq1, idx_freq2, k, kp
+                            ] += kappaband_tmp
 
                 # conversion
-                kappaband = (kappaband * 1e21 * hbar**2) / (
-                    kB * temperature * temperature * volpc * nqpt
+                unit_factor = 1e21 * hbar**2 / (kB * temperature**2 * volpc * nqpt)
+                kappaband *= unit_factor
+                histogram_kappa_d *= unit_factor
+                histogram_kappa_od *= unit_factor
+                np.savetxt(
+                    f"minikappa-{temperature}-{tau_factor}-od_xx.txt",
+                    histogram_kappa_od[:, :, 0, 0],
                 )
+                np.savetxt(
+                    f"minikappa-{temperature}-{tau_factor}-od_yy.txt",
+                    histogram_kappa_od[:, :, 1, 1],
+                )
+                np.savetxt(
+                    f"minikappa-{temperature}-{tau_factor}-od_zz.txt",
+                    histogram_kappa_od[:, :, 2, 2],
+                )
+
                 kappaD = np.zeros((3, 3), dtype=np.complex128, order="C")
                 kappaOD = np.zeros((3, 3), dtype=np.complex128, order="C")
                 kappaF = np.zeros((3, 3), dtype=np.complex128, order="C")
