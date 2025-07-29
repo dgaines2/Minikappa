@@ -111,12 +111,12 @@ class MinikappaManager:
                     omega1 = freqs[iq, i]
                     omega2 = freqs[iq, j]
                     if omega1 > freqcf and omega2 > freqcf:
-                        if omega1 / 2 / pi > 0:
-                            Gamma1 = freqs[iq, i] / 2 / pi * tau_factor
+                        if omega1 > 0:
+                            Gamma1 = omega1 / 2 / pi * tau_factor
                         else:
                             Gamma1 = 1e10
-                        if omega2 / 2 / pi > 0:
-                            Gamma2 = freqs[iq, j] / 2 / pi * tau_factor
+                        if omega2 > 0:
+                            Gamma2 = omega2 / 2 / pi * tau_factor
                         else:
                             Gamma2 = 1e10
                         fBE1 = 1.0 / (np.exp(hbar * omega1 / kB / temperature) - 1.0)
