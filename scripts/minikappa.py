@@ -36,11 +36,13 @@ class MinikappaManager:
         """
         Args:
             phonon (phonopy.Phonopy)
-            mesh (float | 1x3 array[int]): q-point mesh density
+            mesh (float | np.array([3,], dtype=int)): q-point mesh or mesh density
             temperatures (array[float]) in Kelvin
             tau_factors (array[float])
-            n_histogram_bins (int)
-            save_histogram (bool)
+            n_histogram_bins (int): if save_histogram is True, the number of
+                bins for diagonal and off diagonal components of unifiedkappa
+            save_histogram (bool): if True, write files of binned diagonal and
+                off diagonal components of unifiedkappa
         """
         self.phonon = phonon
         self.mesh = mesh
@@ -76,7 +78,8 @@ class MinikappaManager:
     def get_maximum_scattering_rates(freqs, tau_factor):
         """
         Args:
-            freqs (np.array[nqpt, nband])
+            freqs (np.array[nqpt, nband]): frequencies of each phonon mode in
+                units of 2*pi*THz
             tau_factor (float)
                 Note: tau_factor=2 corresponds to the assumption from our paper
         Returns:
@@ -102,17 +105,15 @@ class MinikappaManager:
         """
         Args:
             freqs (np.array[nqpt, nband], dtype=float): phonon frequencies in 2*pi*THz
-            Gamma (np.array[nqpt, nband], dtype=float): phonon lifetimes in ps
-            gvfull (np.array[nqpt, nband, nband, 3], dtype=complex): full diagonal and 
+            Gamma (np.array[nqpt, nband], dtype=float): phonon scattering rates
+                in units of ps^(-1)
+            gvfull (np.array[nqpt, nband, nband, 3], dtype=complex): full diagonal and
                 off-diagonal group velocities in km/s
             temperature (float): temperature in Kelvin
             freqcf (float): cutoff frequency. Any frequency below this value will not
                 contribute to the thermal conductivity
-            filename_prefix (str)
+            filename_prefix (str): beginning of filename for saving outputs
         """
-        if filename_prefix is None:
-            filename_prefix = f"minikappa-{temperature}"
-
         # Units
         hbar = 1.054571726470000e-022
         kB = 1.380648813000000e-023
@@ -160,6 +161,8 @@ class MinikappaManager:
         histogram_kappa_d *= unit_factor
         histogram_kappa_od *= unit_factor
         if self.save_histogram:
+            if filename_prefix is None:
+                filename_prefix = f"minikappa-{temperature}"
             for direction, index in zip(["xx", "yy", "zz"], [0, 1, 2]):
                 np.savetxt(
                     f"{filename_prefix}-d_{direction}.txt",
@@ -259,9 +262,11 @@ class MinikappaManager:
         kwargs=None,
     ):
         """
+        Construct MinikappaManager from a phonopy yaml file
+
         Args:
-            yaml_path (str): path to phonopy.yaml
-            force_constants_filename (str): path to harmonic force constants file
+            yaml_path (str | Path): path to phonopy.yaml
+            force_constants_filename (str | Path): path to harmonic force constants file
             kwargs (optional, dict): dictionary with mesh, temperatures, or tau
                 factors
         """
@@ -273,8 +278,8 @@ class MinikappaManager:
             kwargs = {}
 
         phonon = phonopy.load(
-            yaml_path,
-            force_constants_filename=force_constants_filename,
+            str(yaml_path),
+            force_constants_filename=str(force_constants_filename),
             is_symmetry=False,
         )
         return cls(phonon, **kwargs)
@@ -289,22 +294,28 @@ class MinikappaManager:
         kwargs=None,
     ):
         """
+        Construct MinikappaManager from a set of parameters
+
         Args:
-            poscar_path (str): path to POSCAR file
+            poscar_path (str | Path): path to POSCAR file
             supercell_matrix (3x3 array[int]): supercell matrix
             primitive_matrix (3x3 array[float]): primitive matrix
-            force_constants_filename (str): path to harmonic force constants file
+            force_constants_filename (str | Path): path to harmonic force constants file
             kwargs (optional, dict): dictionary with mesh, temperatures, or tau
                 factors
         """
+        if not Path(poscar_path).exists():
+            raise Exception(f"{poscar_path} not found")
+        if not Path(force_constants_filename).exists():
+            raise Exception(f"{force_constants_filename} not found")
         if kwargs is None:
             kwargs = {}
 
         phonon = phonopy.load(
             supercell_matrix=supercell_matrix,
             primitive_matrix=primitive_matrix,
-            unitcell_filename=poscar_path,
-            force_constants_filename=force_constants_filename,
+            unitcell_filename=str(poscar_path),
+            force_constants_filename=str(force_constants_filename),
             is_symmetry=False,
         )
         return cls(phonon, **kwargs)
@@ -317,6 +328,7 @@ def read_minikappa_file(fpath, verbose=False):
     kappaOD_scalar = np.mean(np.diag(kappaOD))
     kappaF_scalar = np.mean(np.diag(kappaF))
     if verbose:
+        print(
             "Diagonal part of minimum thermal conductivity: "
             + f"{kappaD_scalar:.3f} W/m/K",
         )
