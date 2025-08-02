@@ -13,5 +13,4 @@ minikappa_manager = MinikappaManager.from_parameters(
         "temperatures": [600.0],
     },
 )
-results = minikappa_manager.get_minikappa(verbose=True)
-print(results)
+results = minikappa_manager.run_minikappa(verbose=True)
